@@ -29,7 +29,7 @@ Kafka defaults to at-least-once processing, but can also do at-most-once and exa
 ' zookeeper = distributed key-value store for small data sets.
 '   it's robust, tested, solves some pretty hard problems
 '   some brand new systems leave these problems unsolved.
-' exactly once has a perf hit
+' exactly once has a perf hit (10% - 20%?)
 
 ---
 
@@ -92,6 +92,8 @@ Every partition has a _leader_, the broker which handles reads & writes for the 
 
 If a broker dies, the partitions that it is the leader for undergo leader election. Only an in-sync replica (ISR) can be picked as the new leader.
 
+Brokers may need a lot of file handlers on startup (possibly unlimited).
+
 ---
 
 ### Consuming
@@ -101,6 +103,10 @@ A consumer reads records from a topic as part of a _consumer group_. Multiple co
 Different consumer groups can consume from the same topic, and have no impact on each other.
 
 ' storing offsets in kafka means a consumer can leave & rejoin
+
+---
+
+![consumer-groups](images/consumer-groups.png)
 
 ---
 
@@ -115,6 +121,8 @@ A producer writes data to a topic. It is responsible for choosing the partitioni
 Retention policies are configured at the topic level.
 
 The broker can set defaults for topic retention. The default default is to retain data for 7 days.
+
+' kafka's retention, replication, distribution make it work well as a storage system
 
 ---
 
@@ -203,6 +211,13 @@ A _connector plugin_ is the class used for interfacing with a data system. Lots 
 
 ' plugin examples: sql server, postgres, twitter, blockchain
 
+
+---
+
+Connect easily interfaces with the schema registry for schema creation or validation.
+
+A connector config can have _transforms_ specified to alter records as they are processed; these are usually very simple, but transforms are pluggable.
+
 ---
 
 Example Connector Config:
@@ -223,12 +238,6 @@ Example Connector Config:
     "transforms.setKey.fields":"Id"
 }
 ```
-
----
-
-Connect easily interfaces with the schema registry for schema creation or validation.
-
-A connector config can have _transforms_ specified to alter records as they are processed; these are usually very simple, but transforms are pluggable.
 
 ***
 
@@ -255,6 +264,19 @@ builder.stream[String, MyValue]("sqlServer-MyTable")
 
 ---
 
+Some actions will sink data back to the cluster in their own topic.
+
+```
+builder.stream[...]
+  .selectKey(x => x.Id)
+```
+
+This will sink data to an auto-generated topic, which allows re-keyed records to be partitioned differently so that the correct stream processor instance will see those records. 
+
+' sinking data is relevant for joins and for fault tolerancd
+
+---
+
 The API has features for stateful processing, which is required for joining or aggregating streams.
 
 A _stream_ is the feed of data off a topic, and is viewed as an unending flow of data. It can also be viewed as a changelog for a table. Incoming data on a stream can be merged into a table to represent current state.
@@ -265,7 +287,11 @@ If there are multiple stream processor instances (thus multiple consumers), the 
 
 ---
 
-All joins require some kind of state. Joins may require one or both streams to be re-keyed so that they are processed by the same consumer.
+![streams-architecture-state](images/streams-architecture-states.jpg)
+
+' multiple stream processor instances, input splitting, output sinking
+
+---
 
 Tables can be made _global_, where the entire table is loaded on every instance of a stream processor.
 
@@ -288,57 +314,59 @@ Windowing has 4 options:
 
 ---
 
+When using something with Windowing, you may want to change how timestamps are selected on a record.
+
+* Record timestamp (default timestamp extractor)
+* Wallclock timestamp (timestamp on the stream processor instance)
+* A custom timestamp extractor that retrieves a field from a record
+
+```
+val timestampExtractor = new TimestampExtractor {
+  def extract(record: ConsumerRecord[MyKey, MyValue], previousTimestamp: Long) = ???
+}
+val consumed = Consumed.`with`(keySerde, valueSerde, timestampExtractor)
+```
+
+' using a different timestamp extractor changes the _record timestamp_ when sunk, which is usually helpful
+' serde - serializer / deserializer, using Avro. Avro support is built into streams
+
+---
+
 ![streams-stateful_operations](images/streams-stateful_operations.png)
 
+' relationships & transforms between stream processor types 
+
+--- 
+
+Kafka streams brings two main problems in distributed systems: 
+
+* Out of order messages
+* Duplicate messages
+
+These require careful consideration & planning. Downstream systems may need to be more resilient to duplicate messages. Retry loops may be needed on failed joins.
+
+Broken records may require DLQ or other error handling processes.
+
+---
+
+An example stream processor that counts words from input text:
+
+```
+  val builder = new StreamsBuilder()
+
+  val textLines: KStream[String, String] = 
+    builder.stream[String, String]("streams-plaintext-input")
+
+  val wordCounts: KTable[String, Long] = textLines
+    .flatMapValues(textLine => 
+        textLine.toLowerCase.split("\\W+"))
+    .groupBy((_, word) => word)
+    .count()
+
+  wordCounts.toStream.to("streams-wordcount-output")
+```
+
 ***
-
-### In the wild
-
-*Monitoring & Alerting*
-
-Kafka exposes a _lot_ of metrics to monitor. Some of the most important ones are:
-
-1. The amount of replicas not in-sync. If this stays above 0 for a short length of time (more than a minute), there's an issue.
-2. The amount of controllers in the cluster. If it's more than 1, it's Very Bad (TM).
-3. The amount of brokers currently in the cluster. If it's lower than the amount of brokers, there's an issue.
-
----
-
-Stream processors should monitor:
-
-1. Consumer lag. If a consumer's lag starts to climb and the offset isn't incrementing, it's not processing records.
-2. Application status (such as through systemd).
-
-Other fields, like bytes/sec, are great for checking health, but aren't good for alerts due to fluctations in data rates.
-
-Kafka Connector statuses need to be polled through the API.
-
-Kafka & Friends produce a _huge_ amount of logs and all of them (info+) should be collected.
-
----
-
-*Other thoughts*
-
-Confluent recommends using whatever deployment the organization is most comfortable with (physicals, VMs, containers).
-
-Disk IO has a _huge_ impact on performance. Excess RAM on the brokers for paging goes a long way. 
-' if using spinny drives, RAID config can really matter.
-
-Kafka is _fast_. It can easily support 50,000 to 100,000 writes per second.
-
-' we once overloaded our prod firewall without kafka breaking a sweat.
-
----
-
-If a broker has a lot of partitions, the process will need a _lot_ of file handlers - possibly unlimited.
-
-' if you're too low on file handlers, the system will crash on startup with a useless error message, and it can be very difficult to debug.
-
-Kafka is a distributed system. Joining records may require custom-implemented retry logic if records arrive out of order. At-least once messaging means downstream systems need to be able to handle duplicates.
-
-' duplicate handling can end up being sort of expensive depending on the shape of your data. 
-
----
 
 A "typical" kafka cluster will have:
 
@@ -346,15 +374,21 @@ A "typical" kafka cluster will have:
 * 3 or more Kafka brokers
 * 1 or more Schema Registries
 * 1 or more Connect instances
-* Any amount of stream processors
+* Any amount of stream processors, often with multiple instances of each
 
 Building, configuring, and maintaining these can be a lot of work. Cloud options may limit configurability.
 
+' confluent says to use whatever the org is comfortable with to run kafka
+
 *** 
 
-**References**
-
-[The Log - Jay Krepps](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying)
+**References & Additional Reading**
 
 [Kafka docs](https://kafka.apache.org/documentation/)
 
+[The Log - Jay Krepps](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying)
+
+[Desiging Data-Intensive Applications](https://www.amazon.com/Designing-Data-Intensive-Applications-Reliable-Maintainable/dp/1449373321/ref=sr_1_2?gclid=EAIaIQobChMIgcGazLza4wIVgYbACh0hhAA5EAAYASAAEgIzF_D_BwE&hvadid=243358978238&hvdev=c&hvlocphy=9015306&hvnetw=g&hvpos=1t1&hvqmt=e&hvrand=3459470570870667457&hvtargid=kwd-408354251024&hydadcr=16437_9739787&keywords=designing+data+intensive+application&qid=1564415157)
+
+' "The Log" is inspiration / design thought behind kafka
+' DDIA barely touches kafka but covers every other aspect of what kafka feeds / does / helps solve. good reading.
